@@ -1,57 +1,56 @@
 /**
  * GHCR Pull Proxy - Cloudflare Snippet Edition
+ * Mode: follow redirects
  *
- * 设计目标：
- * - 代理 GHCR 的 Registry v2 鉴权、token、manifest 请求
- * - 改写 WWW-Authenticate realm 到当前代理域名
- * - 不在 Snippet 内跟随 blob 重定向
+ * 目标：
+ * - token / manifest / blob layer 均通过 Cloudflare 中转
+ * - 让 layer 下载路径接近 Worker 版，通常比 manual redirect 更快
  *
- * 支持：
- * - docker pull
- * - containerd / nerdctl pull
- * - 公共 GHCR 镜像
- * - 私有 GHCR 镜像（客户端自行 docker login）
- *
- * 不支持：
- * - docker push
- * - PUT / POST / PATCH / DELETE
- * - layer blob 由 Cloudflare 全程中转
+ * 风险：
+ * - Pro Snippet 每次请求只有 2 个 subrequests
+ * - GHCR blob 常见为：
+ *   Snippet -> ghcr.io -> GitHub object storage
+ * - 一旦额外重定向，可能触发 Error 1202
  */
 
 const UPSTREAM_ORIGIN = "https://ghcr.io";
 const TOKEN_PATH = "/token";
-const VERSION = "ghcr-snippet-control-plane/2026-07-04-v1";
+const VERSION = "ghcr-snippet-follow/2026-07-04-v1";
 
 export default {
   async fetch(request) {
     const clientUrl = new URL(request.url);
 
-    // 方便确认 Snippet 是否已命中。
+    // 用于确认 Snippet 是否命中
     if (clientUrl.pathname === "/") {
       return new Response(
-        "GHCR Snippet proxy is ready.\n" +
-        "Mode: token + manifest proxy; blob redirects are returned to the client.\n",
+        [
+          "GHCR Snippet proxy is ready.",
+          "Mode: follow redirects.",
+          "Token, manifest and blobs are proxied through Cloudflare.",
+          "",
+        ].join("\n"),
         {
           status: 200,
           headers: {
             "content-type": "text/plain; charset=utf-8",
             "cache-control": "no-store",
             "x-ghcr-proxy-version": VERSION,
-            "x-ghcr-proxy-mode": "snippet-control-plane",
+            "x-ghcr-proxy-mode": "snippet-follow",
           },
         },
       );
     }
 
-    // 只允许镜像拉取所需的只读方法。
+    // 只做 pull，不允许 push / delete / upload
     if (request.method !== "GET" && request.method !== "HEAD") {
       return json(
         {
-          error: "This endpoint is pull-only. Only GET and HEAD are allowed.",
+          error: "This proxy is pull-only. Only GET and HEAD are allowed.",
         },
         405,
         {
-          "allow": "GET, HEAD",
+          allow: "GET, HEAD",
         },
       );
     }
@@ -86,26 +85,21 @@ export default {
         headers,
 
         /*
-         * Snippet 关键设置：
+         * 核心差异：
          *
-         * 不跟随 GHCR blob 的 302/307 Location。
+         * follow:
+         *   GHCR 返回 blob 302/307 后，
+         *   Snippet 自动继续访问 GitHub CDN / object storage，
+         *   然后把最终 layer 数据流回传给 Docker。
          *
-         * 否则一次 blob 请求会消耗：
-         * 1. Snippet -> ghcr.io
-         * 2. Snippet -> GitHub CDN / object storage
-         *
-         * Pro Snippet 的 subrequest 上限只有 2，
-         * 一旦上游出现额外重定向，就可能触发 1202。
-         *
-         * redirect: "manual" 会把 Location 原样交给 Docker 客户端，
-         * 由 Docker 直接获取带签名的 blob 下载地址。
+         * 这会获得更接近 Worker 的数据路径和下载性能。
          */
-        redirect: "manual",
+        redirect: "follow",
       });
     } catch (error) {
       return json(
         {
-          error: "Unable to reach ghcr.io.",
+          error: "Unable to reach upstream GHCR or redirected blob storage.",
           detail: String(error?.message || error),
         },
         502,
@@ -114,8 +108,7 @@ export default {
 
     const responseHeaders = new Headers(upstreamResponse.headers);
 
-    // /v2/ 或 manifest 未携带 token 时，GHCR 会返回 401 challenge。
-    // 必须将 realm 改为当前 Snippet 域名，否则 Docker 会直接请求 ghcr.io/token。
+    // 将 GHCR 的 token realm 改写为当前 Snippet 域名
     const authChallenge = responseHeaders.get("www-authenticate");
 
     if (authChallenge) {
@@ -125,35 +118,30 @@ export default {
       );
     }
 
-    // token 响应不应被浏览器/CDN意外缓存。
+    // Token 响应绝不能缓存
     if (isTokenRequest) {
       responseHeaders.set("cache-control", "no-store");
     }
 
     responseHeaders.set("x-content-type-options", "nosniff");
     responseHeaders.set("x-ghcr-proxy-version", VERSION);
-    responseHeaders.set("x-ghcr-proxy-mode", "snippet-control-plane");
+    responseHeaders.set("x-ghcr-proxy-mode", "snippet-follow");
 
-    /*
-     * 注意：
-     * - manifest 请求通常是 200，响应体经过 Snippet 返回。
-     * - blob 请求若 GHCR 返回 302/307，这里会保留 Location。
-     * - Docker 会自行跟随 Location 到 GHCR/GitHub 的对象存储。
-     */
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
       headers: responseHeaders,
     });
   },
 };
 
 /**
- * 保留 Registry 鉴权所需头：
+ * 保留 Docker Registry 请求所需鉴权头：
  * - Authorization: Bearer / Basic
  * - Accept
  * - User-Agent
  *
- * 删除 Cloudflare / Hop-by-hop / 客户端伪造的转发头。
+ * 移除不该转发给 GHCR 的客户端 / Cloudflare 网络头。
  */
 function makeUpstreamHeaders(incomingHeaders) {
   const headers = new Headers(incomingHeaders);
@@ -180,11 +168,11 @@ function makeUpstreamHeaders(incomingHeaders) {
 }
 
 /**
- * 将：
+ * 将:
  * realm="https://ghcr.io/token"
  *
- * 改为：
- * realm="https://你的域名/token"
+ * 改为:
+ * realm="https://当前代理域名/token"
  */
 function rewriteAuthRealm(challenge, proxyOrigin) {
   return challenge.replace(
@@ -200,7 +188,7 @@ function json(payload, status, extraHeaders = {}) {
       "content-type": "application/json; charset=utf-8",
       "cache-control": "no-store",
       "x-ghcr-proxy-version": VERSION,
-      "x-ghcr-proxy-mode": "snippet-control-plane",
+      "x-ghcr-proxy-mode": "snippet-follow",
       ...extraHeaders,
     },
   });
